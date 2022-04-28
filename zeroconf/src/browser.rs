@@ -1,8 +1,10 @@
 //! Trait definition for cross-platform browser
 
+use crate::util::PinnedFuture;
 use crate::{EventLoop, NetworkInterface, Result, ServiceType, TxtRecord};
 use std::any::Any;
 use std::sync::Arc;
+use std::time::Duration;
 
 /// Interface for interacting with underlying mDNS implementation service browsing capabilities.
 pub trait TMdnsBrowser {
@@ -28,9 +30,18 @@ pub trait TMdnsBrowser {
     /// to share state between pre and post-callback. The context type must implement `Any`.
     fn set_context(&mut self, context: Box<dyn Any>);
 
+    /// Sets the timeout to be used on `EventLoop::poll()` when a `Future` is being awaited on.
+    fn set_timeout(&mut self, timeout: Duration);
+
     /// Starts the browser. Returns an `EventLoop` which can be called to keep the browser alive.
-    fn browse_services(&mut self) -> Result<EventLoop>;
+    fn browse(&mut self) -> Result<&EventLoop>;
+
+    // Returns a `Future` that can be `await`ed on to discover the next service.
+    fn browse_async(&mut self) -> BrowseFuture;
 }
+
+/// Future returned by `MdnsBrowser::browse_async()`.
+pub type BrowseFuture<'a> = PinnedFuture<'a, ServiceDiscovery>;
 
 /// Callback invoked from [`MdnsBrowser`] once a service has been discovered and resolved.
 ///

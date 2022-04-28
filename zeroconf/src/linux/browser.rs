@@ -10,6 +10,7 @@ use super::{
     },
     string_list::ManagedAvahiStringList,
 };
+use crate::browser::BrowseFuture;
 use crate::ffi::{c_str, AsRaw, FromRaw};
 use crate::prelude::*;
 use crate::Result;
@@ -25,14 +26,20 @@ use avahi_sys::{
 use libc::{c_char, c_void};
 use std::any::Any;
 use std::ffi::CString;
+use std::future::Future;
+use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::task::Context;
+use std::task::Poll;
+use std::time::Duration;
 use std::{fmt, ptr};
 
 #[derive(Debug)]
 pub struct AvahiMdnsBrowser {
     client: Option<Arc<ManagedAvahiClient>>,
-    poll: Option<Arc<ManagedAvahiSimplePoll>>,
+    event_loop: Option<EventLoop>,
+    timeout: Duration,
     browser: Option<ManagedAvahiServiceBrowser>,
     kind: CString,
     interface_index: AvahiIfIndex,
@@ -43,7 +50,8 @@ impl TMdnsBrowser for AvahiMdnsBrowser {
     fn new(service_type: ServiceType) -> Self {
         Self {
             client: None,
-            poll: None,
+            event_loop: None,
+            timeout: Duration::from_secs(0),
             browser: None,
             kind: c_string!(service_type.to_string()),
             context: Box::into_raw(Box::default()),
@@ -66,14 +74,18 @@ impl TMdnsBrowser for AvahiMdnsBrowser {
         unsafe { (*self.context).user_context = Some(Arc::from(context)) };
     }
 
-    fn browse_services(&mut self) -> Result<EventLoop> {
+    fn set_timeout(&mut self, timeout: Duration) {
+        self.timeout = timeout;
+    }
+
+    fn browse(&mut self) -> Result<&EventLoop> {
         debug!("Browsing services: {:?}", self);
 
-        self.poll = Some(Arc::new(ManagedAvahiSimplePoll::new()?));
+        let poll = ManagedAvahiSimplePoll::new()?;
 
         self.client = Some(Arc::new(ManagedAvahiClient::new(
             ManagedAvahiClientParams::builder()
-                .poll(self.poll.as_ref().unwrap())
+                .poll(&poll)
                 .flags(AvahiClientFlags(0))
                 .callback(Some(client_callback))
                 .userdata(ptr::null_mut())
@@ -97,7 +109,13 @@ impl TMdnsBrowser for AvahiMdnsBrowser {
             )?);
         }
 
-        Ok(EventLoop::new(self.poll.as_ref().unwrap().clone()))
+        self.event_loop = Some(EventLoop::new(poll));
+
+        Ok(self.event_loop.as_ref().unwrap())
+    }
+
+    fn browse_async(&mut self) -> BrowseFuture {
+        Box::pin(AvahiBrowseFuture::new(self))
     }
 }
 
@@ -109,20 +127,51 @@ impl Drop for AvahiMdnsBrowser {
     }
 }
 
+#[derive(new)]
+struct AvahiBrowseFuture<'a> {
+    browser: &'a mut AvahiMdnsBrowser,
+}
+
+impl<'a> Future for AvahiBrowseFuture<'a> {
+    type Output = Result<ServiceDiscovery>;
+
+    fn poll(mut self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<Self::Output> {
+        let waker = ctx.waker();
+        let browser = &mut self.browser;
+        if let Some(result) = unsafe { (*browser.context).discovered_service.take() } {
+            Poll::Ready(result)
+        } else if let Some(event_loop) = &browser.event_loop {
+            if let Err(error) = event_loop.poll(browser.timeout) {
+                return Poll::Ready(Err(error));
+            }
+            waker.wake_by_ref();
+            Poll::Pending
+        } else {
+            if let Err(error) = browser.browse() {
+                return Poll::Ready(Err(error));
+            }
+            waker.wake_by_ref();
+            Poll::Pending
+        }
+    }
+}
+
 #[derive(FromRaw, AsRaw)]
 struct AvahiBrowserContext {
     client: Option<Arc<ManagedAvahiClient>>,
     resolvers: ServiceResolverSet,
+    discovered_service: Option<Result<ServiceDiscovery>>,
     service_discovered_callback: Option<Box<ServiceDiscoveredCallback>>,
     user_context: Option<Arc<dyn Any>>,
 }
 
 impl AvahiBrowserContext {
-    fn invoke_callback(&self, result: Result<ServiceDiscovery>) {
+    fn invoke_callback(&mut self, result: Result<ServiceDiscovery>) {
+        self.discovered_service = Some(result.clone());
         if let Some(f) = &self.service_discovered_callback {
             f(result, self.user_context.clone());
         } else {
-            panic!("attempted to invoke browser callback but none was set");
+            warn!("attempted to invoke browser callback but none was set");
         }
     }
 }
@@ -132,6 +181,7 @@ impl Default for AvahiBrowserContext {
         AvahiBrowserContext {
             client: None,
             resolvers: ServiceResolverSet::default(),
+            discovered_service: None,
             service_discovered_callback: None,
             user_context: None,
         }
@@ -143,6 +193,16 @@ impl fmt::Debug for AvahiBrowserContext {
         f.debug_struct("AvahiBrowserContext")
             .field("client", &self.client)
             .field("resolvers", &self.resolvers)
+            .field("discovered_service", &self.discovered_service)
+            .field(
+                "service_discovered_callback",
+                &self
+                    .service_discovered_callback
+                    .as_ref()
+                    .map(|_| "Some(Box<ServiceDiscoveredCallback>)")
+                    .unwrap_or("None"),
+            )
+            .field("user_context", &self.user_context)
             .finish()
     }
 }
@@ -252,7 +312,7 @@ unsafe extern "C" fn resolve_callback(
 
 #[allow(clippy::too_many_arguments)]
 unsafe fn handle_resolver_found(
-    context: &AvahiBrowserContext,
+    context: &mut AvahiBrowserContext,
     host_name: &str,
     addr: *const AvahiAddress,
     name: &str,

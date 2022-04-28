@@ -9,10 +9,10 @@ fn main() {
 
     browser.set_service_discovered_callback(Box::new(on_service_discovered));
 
-    let event_loop = browser.browse_services().unwrap();
+    let event_loop = browser.browse().unwrap();
 
     loop {
-        // calling `poll()` will keep this browser alive
+        // calling `poll()` will cause the browser to continue discovering services
         event_loop.poll(Duration::from_secs(0)).unwrap();
     }
 }
@@ -23,5 +23,5 @@ fn on_service_discovered(
 ) {
     println!("Service discovered: {:?}", result.unwrap());
 
-    // ...
+    // do stuff
 }
