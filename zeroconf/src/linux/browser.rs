@@ -34,6 +34,7 @@ use std::task::Context;
 use std::task::Poll;
 use std::time::Duration;
 use std::{fmt, ptr};
+use std::{thread, time};
 
 #[derive(Debug)]
 pub struct AvahiMdnsBrowser {
@@ -138,6 +139,7 @@ impl<'a> Future for AvahiBrowseFuture<'a> {
     fn poll(mut self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<Self::Output> {
         let waker = ctx.waker();
         let browser = &mut self.browser;
+        thread::sleep(time::Duration::from_millis(10));
         if let Some(result) = unsafe { (*browser.context).discovered_service.take() } {
             Poll::Ready(result)
         } else if let Some(event_loop) = &browser.event_loop {
